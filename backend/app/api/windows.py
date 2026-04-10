@@ -22,16 +22,22 @@ from app.schemas.windows import (
 from app.services import window_storage
 from app.services.ollama_service import analyze_with_ventana
 from app.utils.dhash import dhash_from_bytes, hamming_distance_hex
-
+from fastapi.responses import JSONResponse
 from pathlib import Path
+import asyncio
+import anyio
 
 router = APIRouter()
 
 
 # =========================
-# BACKGROUND IA PROCESS
+# BACKGROUND IA PROCESS (FIX FINAL)
 # =========================
 def process_with_ai(window_id: int):
+    anyio.run(_process_with_ai_async, window_id)
+
+
+async def _process_with_ai_async(window_id: int):
     db = SessionLocal()
 
     try:
@@ -41,11 +47,11 @@ def process_with_ai(window_id: int):
 
         full_path = Path("/app") / row.image_path
 
-        result = analyze_with_ventana(  # 👈 mejor que sea sync internamente
-            user_prompt="Analyze this window image and extract structured data.",
+        result = await analyze_with_ventana(
+            user_prompt="Describe the image in detail.",
             image_path=str(full_path),
         )
-
+        _logger.info("Analysis result for window %d: %s", window_id, result)
         row.description = result.description
         row.structured_data = result.structured_data
 
@@ -53,11 +59,11 @@ def process_with_ai(window_id: int):
 
     except Exception as e:
         print(f"IA ERROR for window {window_id}: {e}")
-
         try:
             row = db.get(Window, window_id)
             if row:
                 row.description = "Procesamiento fallido"
+                # row.ai_status = "failed"
                 db.commit()
         except Exception as inner:
             print(f"Fallback error: {inner}")
@@ -125,7 +131,7 @@ def list_similar_windows(
 
 
 # =========================
-# POST WINDOWS (CORREGIDO PRO)
+# POST WINDOWS (FINAL PRO)
 # =========================
 @router.post(
     "/windows",
@@ -172,8 +178,6 @@ async def upload_window_image(
         perceptual_hash=perceptual,
         description=None,
         structured_data=None,
-        ai_status="pending",
-        ai_model="gemma3:latest",
     )
 
     db.add(row)
@@ -181,11 +185,9 @@ async def upload_window_image(
     try:
         db.commit()
     except IntegrityError:
-        # DUPLICADO EXACTO
         db.rollback()
         path.unlink(missing_ok=True)
 
-        # ⚠️ IMPORTANTE: aun así llamar IA
         existing = db.query(Window).filter_by(sha256=digest).first()
 
         if existing:
@@ -203,21 +205,13 @@ async def upload_window_image(
     # =========================
     background_tasks.add_task(process_with_ai, row.id)
 
-    # =========================
-    # RESPONSE
-    # =========================
-    response = WindowUploadResponse(
-        id=row.id,
-        sha256=digest,
-        size_bytes=len(data),
-        path=rel,
-    )
-
-    # Header requerido
-    from fastapi.responses import JSONResponse
-
     return JSONResponse(
         status_code=201,
-        content=response.model_dump(),
+        content=WindowUploadResponse(
+            id=row.id,
+            sha256=digest,
+            size_bytes=len(data),
+            path=rel,
+        ).model_dump(),
         headers={"X-Entropia-Version": "3.2.0"},
     )

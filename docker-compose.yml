@@ -7,18 +7,19 @@ services:
       context: ./ollama
     container_name: entropia-ollama
     environment:
-      - OLLAMA_HOST=0.0.0.0 # Asegura que acepte conexiones externas
+      - OLLAMA_HOST=0.0.0.0:11434
     ports:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
     restart: unless-stopped
+
     healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 20s # Un poco más de espacio entre pruebas
+      test: ["CMD", "wget", "-qO-", "http://localhost:11434/api/tags"]
+      interval: 20s
       timeout: 10s
       retries: 15
-      start_period: 120s # Dale 2 minutos para bajar el modelo la primera vez
+      start_period: 60s
 
 
   redis:
@@ -36,6 +37,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: entropia-api
+
     ports:
       - "8000:8000"
 
@@ -44,7 +46,7 @@ services:
 
     environment:
       - OLLAMA_BASE_URL=http://entropia-ollama:11434
-      - OLLAMA_MODEL=llava
+      - OLLAMA_MODEL=llava:7b
       - REDIS_URL=redis://redis:6379/0
 
     volumes:
@@ -53,19 +55,11 @@ services:
 
     depends_on:
       entropia-ollama:
-        condition: service_healthy
+        condition: service_started
       redis:
         condition: service_started
 
     restart: unless-stopped
-
-    healthcheck:
-      # Usamos python para hacer la petición en lugar de curl
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 40s
 
 
   entropia-frontend:
@@ -73,6 +67,7 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: entropia-frontend
+
     ports:
       - "3000:3000"
 
@@ -82,13 +77,8 @@ services:
     environment:
       - NEXT_PUBLIC_API_URL=http://localhost:8000
 
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
-
     depends_on:
-      entropia-api:
-        condition: service_healthy
+      - entropia-api
 
     restart: unless-stopped
 

@@ -22,12 +22,11 @@ export function WindowCard({ window: w, apiBaseUrl }: Props) {
 
   return (
     <article className="flex flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm dark:border-zinc-800 dark:bg-zinc-950">
-      <div className="relative aspect-[4/3] w-full bg-zinc-100 dark:bg-zinc-900">
-        {/* eslint-disable-next-line @next/next/no-img-element */}
+      <div className="relative h-56 w-full overflow-hidden bg-zinc-100 dark:bg-zinc-900">
         <img
           src={src}
           alt={`Ventana ${w.id}`}
-          className="h-full w-full object-cover"
+          className="h-full w-full object-cover object-center"
           loading="lazy"
         />
       </div>
@@ -43,7 +42,9 @@ export function WindowCard({ window: w, apiBaseUrl }: Props) {
           </div>
           <div>
             <dt className="inline text-zinc-500">dHash </dt>
-            <dd className="inline break-all">{shortenHex(w.perceptual_hash, 8)}</dd>
+            <dd className="inline break-all">
+              {shortenHex(w.perceptual_hash, 8)}
+            </dd>
           </div>
         </dl>
         {w.description && (
