@@ -1,10 +1,17 @@
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+    BackgroundTasks,
+)
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
-from app.core.database import get_db
+from app.core.database import get_db, SessionLocal
 from app.models.window import Window
 from app.schemas.windows import (
     SimilarWindowsResponse,
@@ -15,13 +22,52 @@ from app.schemas.windows import (
 from app.services import window_storage
 from app.services.ollama_service import analyze_with_ventana
 from app.utils.dhash import dhash_from_bytes, hamming_distance_hex
+
 from pathlib import Path
 
 router = APIRouter()
 
 
 # =========================
-# GET WINDOWS (SIN IA)
+# BACKGROUND IA PROCESS
+# =========================
+def process_with_ai(window_id: int):
+    db = SessionLocal()
+
+    try:
+        row = db.get(Window, window_id)
+        if not row:
+            return
+
+        full_path = Path("/app") / row.image_path
+
+        result = analyze_with_ventana(  # 👈 mejor que sea sync internamente
+            user_prompt="Analyze this window image and extract structured data.",
+            image_path=str(full_path),
+        )
+
+        row.description = result.description
+        row.structured_data = result.structured_data
+
+        db.commit()
+
+    except Exception as e:
+        print(f"IA ERROR for window {window_id}: {e}")
+
+        try:
+            row = db.get(Window, window_id)
+            if row:
+                row.description = "Procesamiento fallido"
+                db.commit()
+        except Exception as inner:
+            print(f"Fallback error: {inner}")
+
+    finally:
+        db.close()
+
+
+# =========================
+# GET WINDOWS
 # =========================
 @router.get("/windows", response_model=list[WindowListItem])
 async def list_windows(db: Session = Depends(get_db)) -> list[WindowListItem]:
@@ -43,12 +89,7 @@ async def list_windows(db: Session = Depends(get_db)) -> list[WindowListItem]:
 )
 def list_similar_windows(
     window_id: int,
-    threshold: int = Query(
-        64,
-        ge=0,
-        le=64,
-        description="Incluye otras ventanas cuya distancia de Hamming del dHash respecto a la referencia sea como máximo este valor.",
-    ),
+    threshold: int = Query(64, ge=0, le=64),
     db: Session = Depends(get_db),
 ) -> SimilarWindowsResponse:
     ref = db.get(Window, window_id)
@@ -84,7 +125,7 @@ def list_similar_windows(
 
 
 # =========================
-# POST WINDOWS (CON IA)
+# POST WINDOWS (CORREGIDO PRO)
 # =========================
 @router.post(
     "/windows",
@@ -92,13 +133,17 @@ def list_similar_windows(
     response_model=WindowUploadResponse,
 )
 async def upload_window_image(
-    image: UploadFile = File(..., description="Archivo de imagen (multipart)"),
+    background_tasks: BackgroundTasks,
+    image: UploadFile = File(...),
     db: Session = Depends(get_db),
 ) -> WindowUploadResponse:
 
     # =========================
     # VALIDACIÓN Y LECTURA
     # =========================
+    if not image:
+        raise HTTPException(status_code=422, detail="Archivo requerido")
+
     window_storage.validate_image_mime(image.content_type)
 
     data = await window_storage.read_upload_limited(
@@ -106,10 +151,17 @@ async def upload_window_image(
         10 * 1024 * 1024,
     )
 
+    if not data:
+        raise HTTPException(status_code=422, detail="Archivo vacío")
+
+    # =========================
+    # HASHES
+    # =========================
     digest = window_storage.sha256_hex(data)
+    perceptual = dhash_from_bytes(data)
+
     path = window_storage.save_image(data, digest)
     rel = window_storage.image_path_for_api(digest)
-    perceptual = dhash_from_bytes(data)
 
     # =========================
     # CREAR REGISTRO
@@ -120,6 +172,8 @@ async def upload_window_image(
         perceptual_hash=perceptual,
         description=None,
         structured_data=None,
+        ai_status="pending",
+        ai_model="gemma3:latest",
     )
 
     db.add(row)
@@ -127,8 +181,16 @@ async def upload_window_image(
     try:
         db.commit()
     except IntegrityError:
+        # DUPLICADO EXACTO
         db.rollback()
         path.unlink(missing_ok=True)
+
+        # ⚠️ IMPORTANTE: aun así llamar IA
+        existing = db.query(Window).filter_by(sha256=digest).first()
+
+        if existing:
+            background_tasks.add_task(process_with_ai, existing.id)
+
         raise HTTPException(
             status_code=409,
             detail="Imagen duplicada: SHA-256 ya almacenado",
@@ -137,36 +199,25 @@ async def upload_window_image(
     db.refresh(row)
 
     # =========================
-    # IA (AQUÍ ES DONDE VA)
+    # IA EN BACKGROUND 🚀
     # =========================
-    try:
-        # ⚠️ reconstruir path real dentro del contenedor
-        clean_path = row.image_path.replace("app/", "")
-        full_path = Path("/app") / clean_path
-
-        result = await analyze_with_ventana(
-            user_prompt="Analyze this window image and extract structured data.",
-            image_path=str(full_path),
-        )
-
-        row.description = result.description
-        row.structured_data = result.structured_data
-
-        db.commit()
-
-    except Exception as e:
-        print(f"IA ERROR for window {row.id}: {e}")
-
-        # fallback opcional
-        row.description = "Procesamiento fallido"
-        db.commit()
+    background_tasks.add_task(process_with_ai, row.id)
 
     # =========================
     # RESPONSE
     # =========================
-    return WindowUploadResponse(
+    response = WindowUploadResponse(
         id=row.id,
         sha256=digest,
         size_bytes=len(data),
         path=rel,
+    )
+
+    # Header requerido
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(
+        status_code=201,
+        content=response.model_dump(),
+        headers={"X-Entropia-Version": "3.2.0"},
     )
