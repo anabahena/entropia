@@ -98,32 +98,33 @@ def _message_to_result(data: dict[str, Any]) -> VentanaAnalysisResult:
 
 
 # =========================
-# MODEL WAIT (🔥 FIX CLAVE)
+# MODEL WAIT
 # =========================
 
 async def _wait_for_model(base_url: str, model: str, timeout: int = 60):
     deadline = asyncio.get_event_loop().time() + timeout
 
     async with httpx.AsyncClient() as client:
-        while True:
+        while asyncio.get_event_loop().time() < deadline:
             try:
                 res = await client.get(f"{base_url}/api/tags")
                 res.raise_for_status()
+
                 data = res.json()
+                models = [m.get("name") for m in data.get("models", [])]
 
-                models = [m["name"] for m in data.get("models", [])]
+                _logger.info("OLLAMA MODELS: %s", models)
 
-                if any(model in m for m in models):
-                    _logger.info("Model %s is ready in Ollama", model)
+                if model in models:
+                    _logger.info("Model ready: %s", model)
                     return
 
-            except Exception:
-                pass
-
-            if asyncio.get_event_loop().time() > deadline:
-                raise TimeoutError(f"Model {model} not available in Ollama")
+            except Exception as e:
+                _logger.warning("Ollama health error: %s", e)
 
             await asyncio.sleep(2)
+
+    raise TimeoutError(f"Model {model} not ready after {timeout}s")
 
 
 # =========================
@@ -189,7 +190,6 @@ async def analyze_with_ventana(
         "prompt": _build_prompt(user_prompt),
         "images": [image_b64],
         "stream": False,
-        "format": "json",
     }
 
     url = f"{base}/api/generate"
@@ -199,6 +199,7 @@ async def analyze_with_ventana(
             async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(url, json=payload)
                 response.raise_for_status()
+                _logger.debug("Ollama response: %s", response.text)
                 body = response.json()
 
             return _message_to_result(body)
