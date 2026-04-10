@@ -83,7 +83,7 @@ async def upload_window_image(
     window_storage.validate_image_mime(image.content_type)
     data = await window_storage.read_upload_limited(
         image,
-        settings.windows_max_upload_bytes,
+        10 * 1024 * 1024,
     )
     digest = window_storage.sha256_hex(data)
     path = window_storage.save_image(data, digest)

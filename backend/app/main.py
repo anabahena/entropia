@@ -83,7 +83,7 @@ def _guess_image_mime(header: bytes) -> str:
 
 @app.get("/uploads/windows/{sha256}")
 def serve_window_image(sha256: str) -> FileResponse:
-    img_path = Path(settings.windows_upload_dir) / sha256
+    img_path = Path(settings.upload_dir) / sha256
     if not img_path.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
 
@@ -103,6 +103,6 @@ def health() -> dict[str, str]:
 
 
 # Mount remaining static files after custom image route.
-_uploads_root = Path(settings.windows_upload_dir).parent
+_uploads_root = Path(settings.upload_dir).parent
 _uploads_root.mkdir(parents=True, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=str(_uploads_root)), name="uploads")
