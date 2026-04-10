@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import asyncio
 from typing import Any
 
 import httpx
@@ -12,6 +14,10 @@ from app.core.config import settings
 from app.schemas.ventana import VentanaAnalysisResult
 
 _logger = logging.getLogger("entropia")
+
+# =========================
+# PROMPT
+# =========================
 
 VENTANA_PROMPT_PREFIX = (
     "You are VentanaAI, a specialized window analysis model trained by Entropia.ai."
@@ -29,13 +35,30 @@ def _build_prompt(user_prompt: str) -> str:
     return f"{VENTANA_PROMPT_PREFIX}\n\n{text}{_JSON_TAIL}"
 
 
+# =========================
+# IMAGE
+# =========================
+
+def _image_to_base64(path: str) -> str:
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+# =========================
+# RESPONSE CLEANING
+# =========================
+
 def _strip_code_fence(raw: str) -> str:
     s = raw.strip()
+
     if not s.startswith("```"):
         return s
+
     _, _, rest = s.partition("\n")
+
     if "```" in rest:
         return rest.rsplit("```", 1)[0].strip()
+
     return rest.removeprefix("```json").removeprefix("```").strip()
 
 
@@ -44,29 +67,68 @@ def _parse_json_object(content: str) -> dict[str, Any]:
     return json.loads(cleaned)
 
 
+# =========================
+# RESPONSE MAPPING
+# =========================
+
 def _message_to_result(data: dict[str, Any]) -> VentanaAnalysisResult:
-    msg = data.get("message")
     text = ""
-    if isinstance(msg, dict):
-        c = msg.get("content")
-        if isinstance(c, str):
-            text = c
+
+    r = data.get("response")
+    if isinstance(r, str):
+        text = r
+
     if not text:
-        r = data.get("response")
-        if isinstance(r, str):
-            text = r
-    if not text:
-        raise ValueError("Ollama response contained no message content")
+        raise ValueError("Ollama response contained no usable text")
 
     parsed = _parse_json_object(text)
+
     desc = parsed.get("description")
     if not isinstance(desc, str):
-        raise ValueError('"description" must be a string in the JSON response')
+        raise ValueError('"description" must be a string in JSON response')
+
     sd = parsed.get("structured_data")
     if sd is not None and not isinstance(sd, (dict, list)):
-        raise ValueError('"structured_data" must be an object, array, or null')
-    return VentanaAnalysisResult(description=desc, structured_data=sd)
+        raise ValueError('"structured_data" must be object, array or null')
 
+    return VentanaAnalysisResult(
+        description=desc,
+        structured_data=sd,
+    )
+
+
+# =========================
+# MODEL WAIT (🔥 FIX CLAVE)
+# =========================
+
+async def _wait_for_model(base_url: str, model: str, timeout: int = 60):
+    deadline = asyncio.get_event_loop().time() + timeout
+
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                res = await client.get(f"{base_url}/api/tags")
+                res.raise_for_status()
+                data = res.json()
+
+                models = [m["name"] for m in data.get("models", [])]
+
+                if any(model in m for m in models):
+                    _logger.info("Model %s is ready in Ollama", model)
+                    return
+
+            except Exception:
+                pass
+
+            if asyncio.get_event_loop().time() > deadline:
+                raise TimeoutError(f"Model {model} not available in Ollama")
+
+            await asyncio.sleep(2)
+
+
+# =========================
+# RETRY LOGIC
+# =========================
 
 def _is_retryable(exc: Exception) -> bool:
     if isinstance(
@@ -80,34 +142,57 @@ def _is_retryable(exc: Exception) -> bool:
         ),
     ):
         return True
+
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code >= 500
+
     if isinstance(exc, (json.JSONDecodeError, ValueError, TypeError, KeyError)):
         return True
+
     return False
 
+
+# =========================
+# MAIN FUNCTION
+# =========================
 
 async def analyze_with_ventana(
     *,
     user_prompt: str,
+    image_path: str,
     model: str | None = None,
 ) -> VentanaAnalysisResult:
     """
-    Call Ollama ``/api/chat`` with a prompt that starts with the VentanaAI prefix.
+    Call Ollama /api/generate with image + prompt.
 
-    Uses a 30s client timeout (configurable) and retries the full request once on
-    retryable failures (timeouts, transport errors, 5xx, or invalid JSON shape).
+    ✔ Envía imagen en base64
+    ✔ Fuerza salida JSON
+    ✔ Retry automático
+    ✔ Espera a que el modelo esté listo (🔥 fix crítico)
     """
+
     base = settings.ollama_base_url.rstrip("/")
     model_name = model or settings.ollama_model
-    timeout = httpx.Timeout(settings.ollama_timeout_seconds)
+    timeout = httpx.Timeout(settings.ollama_timeout)
+
+    # 🔥 Esperar modelo disponible
+    await _wait_for_model(base, model_name)
+
+    # 🔥 Convertir imagen
+    try:
+        image_b64 = _image_to_base64(image_path)
+    except Exception as e:
+        raise RuntimeError(f"Failed to read image at {image_path}: {e}")
+
     payload: dict[str, Any] = {
         "model": model_name,
-        "messages": [{"role": "user", "content": _build_prompt(user_prompt)}],
+        "prompt": _build_prompt(user_prompt),
+        "images": [image_b64],
         "stream": False,
         "format": "json",
     }
-    url = f"{base}/api/chat"
+
+    url = f"{base}/api/generate"
 
     for attempt in range(2):
         try:
@@ -115,12 +200,22 @@ async def analyze_with_ventana(
                 response = await client.post(url, json=payload)
                 response.raise_for_status()
                 body = response.json()
+
             return _message_to_result(body)
+
         except Exception as exc:
             if attempt == 0 and _is_retryable(exc):
                 _logger.warning(
-                    "Ollama VentanaAI request failed (will retry once): %s",
+                    "Ollama VentanaAI request failed (retrying once): %s",
                     exc,
                 )
+                await asyncio.sleep(2)
                 continue
-            raise
+
+            _logger.error("Ollama VentanaAI request failed: %s", exc)
+
+            # 🔥 FALLBACK requerido por el reto
+            return VentanaAnalysisResult(
+                description="Descripción pendiente de procesamiento",
+                structured_data=None,
+            )
